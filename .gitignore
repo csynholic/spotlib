@@ -1,0 +1,26 @@
+node_modules/
+dist/
+
+# Credentials — NEVER commit these
+.env
+*.wvd
+spotify_credentials.json
+device.wvd
+
+# Cache
+cache/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE / editor
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code local settings
+.claude/
