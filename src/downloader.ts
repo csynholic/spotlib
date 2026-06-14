@@ -73,7 +73,7 @@ export class SpotifyDownloader {
     });
   }
 
-  private getCachedPath(trackId: string): string | null {
+  getCachedPath(trackId: string): string | null {
     for (const ext of AUDIO_EXTS) {
       const filePath = path.join(this.deps.cachePath, `${trackId}${ext}`);
       if (fs.existsSync(filePath)) return filePath;
@@ -409,6 +409,7 @@ export class SpotifyDownloader {
     for (const file of sorted) {
       if (totalSize + incomingSize <= this.deps.maxCacheSize) break;
       fs.unlinkSync(path.join(this.deps.cachePath, file.name));
+      try { fs.unlinkSync(path.join(this.deps.cachePath, `${file.trackId}.meta`)); } catch {}
       this.lru.delete(file.trackId);
       totalSize -= file.size;
       this.deps.logger.info(`evicted cached track: ${file.trackId}`);

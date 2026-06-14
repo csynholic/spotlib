@@ -110,6 +110,11 @@ export class SpotLib {
     return this.api.getAlbumTracks(albumId);
   }
 
+  /** Return the cached file path for a track, or null if not cached */
+  getCachedPath(trackId: string): string | null {
+    return this.downloader.getCachedPath(trackId);
+  }
+
   /** Invalidate all cached tokens */
   invalidateTokens(): void {
     this.api.invalidateTokens();

@@ -19,6 +19,7 @@ const spot = new SpotLib({
   clientId: process.env.SPOTIFY_CLIENT_ID,
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
   cachePath: noMusicCache ? join(__dir, "cache", "presence") : undefined,
+  maxCacheSize: Infinity,
 });
 
 const PORT = process.env.NODE_PORT || 7331;
@@ -38,17 +39,29 @@ const checkApi = new SpotifyApi({
 });
 
 let checkSession = null;
+let checkConnecting = null;
 
 async function getCheckSession() {
   if (checkSession?.isConnected()) return checkSession;
-  checkSession = new SpotifySession({
-    api: checkApi,
-    fetchFn: globalThis.fetch,
-    logger: SILENT_LOG,
-    credentialsPath: CRED_PATH,
-  });
-  await checkSession.connect();
-  return checkSession;
+  if (!checkConnecting) {
+    checkConnecting = (async () => {
+      const session = new SpotifySession({
+        api: checkApi,
+        fetchFn: globalThis.fetch,
+        logger: SILENT_LOG,
+        credentialsPath: CRED_PATH,
+      });
+      await session.connect();
+      checkSession = session;
+      checkConnecting = null;
+      return session;
+    })().catch((err) => {
+      checkSession = null;
+      checkConnecting = null;
+      throw err;
+    });
+  }
+  return checkConnecting;
 }
 
 // preferred formats (OGG first, then MP3) — all via Shannon path
@@ -137,6 +150,7 @@ async function canDownloadViaShanon(trackId) {
     // reset session on socket errors so next call reconnects
     if (err.code === "ECONNRESET" || err.message?.includes("ECONNRESET") || err.message?.includes("timed out")) {
       checkSession = null;
+      checkConnecting = null;
     }
     return false; // key denied (Widevine) or network error
   }
@@ -293,8 +307,10 @@ const server = http.createServer(async (req, res) => {
 
     // GET /check/:id — checks audio key availability without downloading
     if (req.method === "GET" && parts[0] === "check" && parts[1]) {
+      const cachedPath = spot.getCachedPath(parts[1]);
+      if (cachedPath) return json(res, { downloadable: true, cached: true });
       const downloadable = await canDownloadViaShanon(parts[1]);
-      return json(res, { downloadable });
+      return json(res, { downloadable, cached: false });
     }
 
     json(res, { error: "not found" }, 404);

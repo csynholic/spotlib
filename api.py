@@ -117,6 +117,13 @@ def _purge_expired():
                 log.info(f"evicted {f.stem}")
         except Exception:
             pass
+    # clean up orphaned .meta files (audio evicted by Node LRU without removing sidecar)
+    for m in PRESENCE_DIR.glob("*.meta"):
+        if not _ppath(m.stem).exists():
+            try:
+                m.unlink()
+            except Exception:
+                pass
 
 
 async def _cleanup_loop():
