@@ -12,6 +12,7 @@ const __dir = dirname(fileURLToPath(import.meta.url));
 config({ path: join(__dir, ".env") });
 
 const noMusicCache = ["1", "true", "yes"].includes((process.env.NO_MUSIC_CACHE ?? "").toLowerCase());
+const noEvict = ["1", "true", "yes"].includes((process.env.NO_EVICT ?? "").toLowerCase());
 
 const spot = new SpotLib({
   spDc: process.env.SP_DC,
@@ -20,6 +21,7 @@ const spot = new SpotLib({
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
   cachePath: noMusicCache ? join(__dir, "cache", "presence") : undefined,
   maxCacheSize: Infinity,
+  noEvict,
 });
 
 const PORT = process.env.NODE_PORT || 7331;

@@ -26,6 +26,7 @@ export interface DownloaderDeps {
   pythonCmd: string;
   widevineHelperPath: string;
   proxy?: ProxyConfig;
+  noEvict?: boolean;
 }
 
 export class SpotifyDownloader {
@@ -379,6 +380,7 @@ export class SpotifyDownloader {
   }
 
   private async evictIfNeeded(incomingSize: number): Promise<void> {
+    if (this.deps.noEvict) return;
     if (!fs.existsSync(this.deps.cachePath)) return;
 
     const files = fs.readdirSync(this.deps.cachePath).filter((f) =>

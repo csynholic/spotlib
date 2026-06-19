@@ -23,6 +23,9 @@ export interface SpotLibConfig {
   /** Max cache size in bytes (default: 2GB) */
   maxCacheSize?: number;
 
+  /** Never delete cached audio files (overrides maxCacheSize eviction) */
+  noEvict?: boolean;
+
   /** Python command for widevine helper (default: python3) */
   pythonCmd?: string;
 

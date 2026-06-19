@@ -76,6 +76,7 @@ export class SpotLib {
       pythonCmd,
       widevineHelperPath,
       proxy: proxyConfig,
+      noEvict: config.noEvict,
     });
   }
 

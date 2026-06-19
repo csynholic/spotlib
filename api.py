@@ -41,6 +41,7 @@ NODE_URL     = f"http://127.0.0.1:{NODE_PORT}"
 API_KEY      = os.getenv("API_KEY", "")
 CACHE_TTL        = 90 * 24 * 60 * 60  # 90 days (default)
 DOWNLOAD_CMD_TTL = 60 * 60             # 1 hour for /download endpoints
+NO_EVICT         = os.getenv("NO_EVICT", "").lower() in ("1", "true", "yes")
 PRESENCE_DIR     = BASE_DIR / "cache" / "presence"
 PRESENCE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -95,14 +96,17 @@ def cache_get(track_id: str) -> Path | None:
         return None
     expires_at = _read_expires_at(track_id)
     if expires_at is None or time.time() > expires_at:
-        p.unlink(missing_ok=True)
-        _mpath(track_id).unlink(missing_ok=True)
+        if not NO_EVICT:
+            p.unlink(missing_ok=True)
+            _mpath(track_id).unlink(missing_ok=True)
         return None
     return p
 
 
 def _purge_expired():
     """Delete presence files + their cache/music originals when TTL exceeded."""
+    if NO_EVICT:
+        return
     now = time.time()
     music_dir = BASE_DIR / "cache" / "music"
     for f in PRESENCE_DIR.glob("*.mp3"):
