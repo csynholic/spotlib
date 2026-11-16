@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -133,11 +134,27 @@ def _purge_expired():
 async def _cleanup_loop():
     while True:
         await asyncio.sleep(3600)
-        _purge_expired()
+        await asyncio.get_running_loop().run_in_executor(None, _purge_expired)
 
 
 _node_proc: subprocess.Popen | None = None
 _node_lock: asyncio.Lock | None = None
+_http: httpx.AsyncClient | None = None   # shared pooled client for the Node backend
+_tasks: set[asyncio.Task] = set()        # keep refs so background tasks aren't GC'd
+
+_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
+
+
+def _norm_id(raw: str) -> str:
+    """Extract a bare track id from a URL/URI/id and reject anything path-like."""
+    for prefix in ("open.spotify.com/track/", "spotify:track:"):
+        if prefix in raw:
+            raw = raw.split(prefix)[-1].split("?")[0]
+            break
+    raw = raw.strip()
+    if not _ID_RE.match(raw):
+        raise HTTPException(400, detail="invalid track id")
+    return raw
 
 
 def _start_node() -> subprocess.Popen:
@@ -150,15 +167,14 @@ def _start_node() -> subprocess.Popen:
 
 async def _wait_for_node(timeout: float = 25.0):
     deadline = time.monotonic() + timeout
-    async with httpx.AsyncClient() as c:
-        while time.monotonic() < deadline:
-            try:
-                r = await c.get(f"{NODE_URL}/health", timeout=2.0)
-                if r.is_success:
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
+    while time.monotonic() < deadline:
+        try:
+            r = await _http.get("/health", timeout=2.0)
+            if r.is_success:
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
     raise RuntimeError("node backend did not start in time")
 
 
@@ -180,15 +196,24 @@ async def _node_watchdog():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _node_proc, _node_lock
+    global _node_proc, _node_lock, _http
     _node_lock = asyncio.Lock()
+    _http = httpx.AsyncClient(
+        base_url=NODE_URL,
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
     _purge_expired()  # clean up any files left over from a previous crash
     _node_proc = _start_node()
     await _wait_for_node()
     log.info(f"node backend ready on :{NODE_PORT}")
-    asyncio.create_task(_cleanup_loop())
-    asyncio.create_task(_node_watchdog())
+    for coro in (_cleanup_loop(), _node_watchdog()):
+        t = asyncio.create_task(coro)
+        _tasks.add(t)
+        t.add_done_callback(_tasks.discard)
     yield
+    for t in list(_tasks):
+        t.cancel()
+    await _http.aclose()
     if _node_proc and _node_proc.poll() is None:
         _node_proc.terminate()
         _node_proc.wait()
@@ -218,23 +243,45 @@ def _real_ip(request: Request) -> str:
     return fwd.split(",")[0].strip() if fwd else host or "unknown"
 
 
-limiter = Limiter(key_func=_real_ip, default_limits=["9999999/minute"])
+limiter = Limiter(key_func=_real_ip, default_limits=[])
 
 app = FastAPI(title="spotlib", version="2.0.0", lifespan=lifespan, redirect_slashes=False)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
+async def _node(method: str, path: str, timeout: float = 15.0, **kw) -> httpx.Response:
+    try:
+        return await _http.request(method, path, timeout=timeout, **kw)
+    except httpx.RequestError as e:
+        raise HTTPException(502, detail=str(e))
+
+
+# one in-flight download per track: concurrent requests share the same result
+_inflight: dict[str, asyncio.Future] = {}
+
+
 async def _node_download(input_str: str) -> dict:
-    async with httpx.AsyncClient() as c:
-        try:
-            r = await c.post(f"{NODE_URL}/download", json={"input": input_str}, timeout=180.0)
-        except httpx.RequestError as e:
-            raise HTTPException(502, detail=str(e))
-    if not r.is_success:
-        body = r.json() if "application/json" in r.headers.get("content-type", "") else {}
-        raise HTTPException(r.status_code, detail=body.get("error", r.text))
-    return r.json()
+    key = _norm_id(input_str)
+    if key in _inflight:
+        return await asyncio.shield(_inflight[key])
+    fut = asyncio.get_running_loop().create_future()
+    _inflight[key] = fut
+    try:
+        r = await _node("POST", "/download", timeout=180.0, json={"input": input_str})
+        if not r.is_success:
+            body = r.json() if "application/json" in r.headers.get("content-type", "") else {}
+            raise HTTPException(r.status_code, detail=body.get("error", r.text))
+        data = r.json()
+        fut.set_result(data)
+        return data
+    except BaseException as e:
+        fut.set_exception(e)
+        fut.exception()  # mark retrieved to avoid "never retrieved" warnings
+        raise
+    finally:
+        _inflight.pop(key, None)
+
 
 @app.get("/health")
 async def health():
@@ -245,7 +292,7 @@ async def health():
 @limiter.limit("60/minute")
 async def get_track(request: Request, track_id: str):
     """Serve cached MP3. 404 if not in presence cache (nothing was pre-fetched)."""
-    p = cache_get(track_id)
+    p = cache_get(_norm_id(track_id))
     if not p:
         raise HTTPException(404, detail="not cached")
     return FileResponse(str(p), media_type="audio/mpeg", filename=f"{track_id}.mp3")
@@ -260,11 +307,7 @@ class DownloadBody(BaseModel):
 async def trigger_download(body: DownloadBody):
     """Pre-fetch a track. Default TTL 90 days; pass ttl to override. Never shrinks existing TTL."""
     ttl = body.ttl if body.ttl is not None else CACHE_TTL
-    track_id = body.input
-    for prefix in ["open.spotify.com/track/", "spotify:track:"]:
-        if prefix in track_id:
-            track_id = track_id.split(prefix)[-1].split("?")[0].strip()
-            break
+    track_id = _norm_id(body.input)
 
     existing = cache_get(track_id)
     if existing:
@@ -284,6 +327,7 @@ async def trigger_download(body: DownloadBody):
 async def download_track(track_id: str, ttl: int | None = None):
     """On-demand download — always works. Serves MP3 directly. Default TTL 90 days."""
     effective_ttl = ttl if ttl is not None else CACHE_TTL
+    track_id = _norm_id(track_id)
     p = cache_get(track_id)
     if not p:
         data = await _node_download(track_id)
@@ -299,11 +343,7 @@ async def download_track(track_id: str, ttl: int | None = None):
 @app.get("/lyrics/{track_id}", dependencies=[Depends(require_key)])
 async def get_lyrics(track_id: str):
     """Synced lyrics for a track. Null if unavailable."""
-    async with httpx.AsyncClient() as c:
-        try:
-            r = await c.get(f"{NODE_URL}/lyrics/{track_id}", timeout=15.0)
-        except httpx.RequestError as e:
-            raise HTTPException(502, detail=str(e))
+    r = await _node("GET", f"/lyrics/{_norm_id(track_id)}")
     if not r.is_success:
         raise HTTPException(r.status_code)
     data = r.json()
@@ -316,14 +356,14 @@ async def get_lyrics(track_id: str):
 @limiter.limit("30/minute")
 async def check_track(request: Request, track_id: str):
     """Check if a track is cached or downloadable — never triggers a download."""
+    track_id = _norm_id(track_id)
     if cache_get(track_id):
         return {"cached": True, "downloadable": True}
-    async with httpx.AsyncClient() as c:
-        try:
-            r = await c.get(f"{NODE_URL}/check/{track_id}", timeout=15.0)
-            downloadable = r.json().get("downloadable", False) if r.is_success else False
-        except Exception:
-            downloadable = False
+    try:
+        r = await _node("GET", f"/check/{track_id}")
+        downloadable = r.json().get("downloadable", False) if r.is_success else False
+    except Exception:
+        downloadable = False
     return {"cached": False, "downloadable": downloadable}
 
 
@@ -331,11 +371,7 @@ async def check_track(request: Request, track_id: str):
 @limiter.limit("300/minute")
 async def canvas_track(request: Request, track_id: str):
     """Fetch Spotify Canvas looping video URL(s) for a track. Proxies to Node backend."""
-    async with httpx.AsyncClient() as c:
-        try:
-            r = await c.get(f"{NODE_URL}/canvas/{track_id}", timeout=15.0)
-        except httpx.RequestError as e:
-            raise HTTPException(502, detail=str(e))
+    r = await _node("GET", f"/canvas/{_norm_id(track_id)}")
     if not r.is_success:
         raise HTTPException(r.status_code, detail=r.text)
     return r.json()
