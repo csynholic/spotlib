@@ -1,0 +1,11 @@
+node_modules
+dist
+cache
+.git
+.env
+.env.*
+!.env.example
+spotify_credentials.json
+*.wvd
+.idea
+.claude

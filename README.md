@@ -205,3 +205,19 @@ spotlib/
 ## License
 
 MIT
+
+## HTTP API
+
+`server.mjs` serves the API on port 8888 (`PORT`/`HOST` to change). Run with `npm start` or `docker compose up -d --build`.
+
+| Route | Auth | Description |
+|-------|------|-------------|
+| `GET /health` | – | liveness |
+| `GET /track/:id` | – | cached MP3 (404 if not cached) |
+| `GET /check/:id` | – | cached / downloadable |
+| `POST /download` | `X-API-Key` | `{input, ttl?}` pre-fetch a track |
+| `GET /download/:id` | `X-API-Key` | download and serve MP3 |
+| `GET /lyrics/:id` | `X-API-Key` | synced lyrics |
+| `GET /canvas/:id` | `X-API-Key` | Spotify Canvas videos |
+
+Copy `.env.example` to `.env` and set `API_KEY`. Loopback callers skip the key.

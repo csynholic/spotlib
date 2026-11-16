@@ -1,26 +1,28 @@
 node_modules/
 dist/
 
-# Credentials — NEVER commit these
 .env
+.env.*
+!.env.example
 *.wvd
-spotify_credentials.json
 device.wvd
+spotify_credentials.json
+*credentials*.json
+*.pem
+*.key
+*.p12
+*.log
 
-# Cache
 cache/
 
-# OS junk
 .DS_Store
 Thumbs.db
-
-# IDE / editor
 .idea/
+.vscode/
 
-# Python
 __pycache__/
 *.pyc
-*.pyo
+venv/
+.venv/
 
-# Claude Code local settings
 .claude/

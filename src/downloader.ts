@@ -234,6 +234,7 @@ export class SpotifyDownloader {
         "-loglevel", "error",
         "-hide_banner",
         "-y",
+        "-protocol_whitelist", "file",
         "-decryption_key", keyResult.key,
         "-i", encryptedPath,
         "-c", "copy",
@@ -280,11 +281,12 @@ export class SpotifyDownloader {
       "-loglevel", "error",
       "-hide_banner",
       "-y",
+      "-protocol_whitelist", "file",
       "-i", rawPath,
     ];
 
     if (coverPath) {
-      ffmpegArgs.push("-i", coverPath);
+      ffmpegArgs.push("-protocol_whitelist", "file", "-i", coverPath);
       ffmpegArgs.push("-map", "0:a", "-map", "1:0");
       ffmpegArgs.push("-disposition:v:0", "attached_pic");
     }

@@ -132,8 +132,13 @@ export class SpotLib {
       if (parsed.type !== "track") {
         throw new Error(`Expected a track, got ${parsed.type}. Use getPlaylistTracks() or getAlbumTracks() for collections.`);
       }
-      return parsed.id;
+      return assertTrackId(parsed.id);
     }
-    return input;
+    return assertTrackId(input);
   }
+}
+
+function assertTrackId(id: string): string {
+  if (!/^[A-Za-z0-9]{22}$/.test(id)) throw new Error("invalid track id");
+  return id;
 }
