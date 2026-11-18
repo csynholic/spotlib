@@ -11,6 +11,7 @@ services:
     volumes:
       - ./cache:/app/cache
       - ./spotify_credentials.json:/app/spotify_credentials.json
+      - ./spotify_oauth.json:/app/spotify_oauth.json
     read_only: true
     tmpfs:
       - /tmp

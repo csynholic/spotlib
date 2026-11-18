@@ -6,6 +6,7 @@ import { SpotifySession } from "./dist/session.js";
 import { SpotifyApi, base62ToHex } from "./dist/api.js";
 import { ProtoWriter, readAll } from "./dist/proto.js";
 import { generateSpotifyTOTP, fetchSpotifyTotpSecret, computeTotp } from "./dist/totp.js";
+import { WebSocketServer } from "ws";
 import { config } from "dotenv";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
@@ -272,7 +273,7 @@ function clientIp(req) {
   const peer = req.socket.remoteAddress || "";
   if (TRUSTED.has(peer)) {
     const fwd = req.headers["x-forwarded-for"];
-    if (fwd) return String(fwd).split(",").pop().trim();
+    return fwd ? String(fwd).split(",").pop().trim() : "127.0.0.1";
   }
   return peer;
 }
@@ -552,6 +553,206 @@ const server = http.createServer(async (req, res) => {
     json(res, { detail: "internal error" }, 500);
   }
 });
+
+const WS_MAX_PER_IP = 5;
+const POLL_PLAYING_MS = 3000;
+const POLL_IDLE_MS = 5000;
+const MAX_RETRY_AFTER_S = 120;
+const OAUTH_PATH = join(__dir, "spotify_oauth.json");
+let oauthCache = null;
+
+async function getOauthToken() {
+  if (oauthCache && Date.now() < oauthCache.expiresAt - 60_000) return oauthCache.token;
+  let refresh;
+  try {
+    refresh = JSON.parse(fs.readFileSync(OAUTH_PATH, "utf8")).refresh_token;
+  } catch {
+    throw new Error("spotify_oauth.json missing — run `node oauth-setup.mjs`");
+  }
+  const r = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + Buffer.from(`${process.env.SPOTIFY_CLIENT_ID}:${process.env.SPOTIFY_CLIENT_SECRET}`).toString("base64"),
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refresh }),
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!r.ok) throw new Error(`oauth refresh ${r.status}`);
+  const d = await r.json();
+  if (d.refresh_token) fs.writeFileSync(OAUTH_PATH, JSON.stringify({ refresh_token: d.refresh_token }), { mode: 0o600 });
+  oauthCache = { token: d.access_token, expiresAt: Date.now() + d.expires_in * 1000 };
+  return oauthCache.token;
+}
+
+const wss = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+const wsPerIp = new Map();
+
+let nowPlaying = { type: "state", playing: false, item: null };
+let pollTimer = null;
+let pollBackoffUntil = 0;
+let lastKey = "";
+let hasState = false;
+const stateWaiters = [];
+
+function waitFirstState() {
+  if (hasState) return Promise.resolve();
+  return new Promise((resolve) => {
+    stateWaiters.push(resolve);
+    setTimeout(resolve, 5000).unref();
+  });
+}
+
+function shapeNowPlaying(d, fetchedAt) {
+  const it = d?.item;
+  if (!d || !it) return { type: "state", playing: false, item: null, timestamp: fetchedAt };
+  return {
+    type: "state",
+    playing: !!d.is_playing,
+    progress_ms: d.progress_ms ?? 0,
+    timestamp: fetchedAt,
+    device: d.device?.name ?? null,
+    shuffle: d.shuffle_state ?? null,
+    repeat: d.repeat_state ?? null,
+    item: {
+      id: it.id,
+      type: d.currently_playing_type,
+      name: it.name,
+      artists: (it.artists ?? [it.show]).filter(Boolean).map((a) => a.name),
+      album: it.album?.name ?? it.show?.name ?? null,
+      image: (it.album?.images ?? it.images)?.[0]?.url ?? null,
+      duration_ms: it.duration_ms,
+    },
+  };
+}
+
+async function pollNowPlaying() {
+  pollTimer = null;
+  if (wss.clients.size === 0) return;
+  let delay = POLL_IDLE_MS;
+  try {
+    if (Date.now() < pollBackoffUntil) throw Object.assign(new Error("backoff"), { skip: true });
+    const token = await getOauthToken();
+    const t0 = Date.now();
+    const r = await fetch("https://api.spotify.com/v1/me/player/currently-playing?additional_types=episode", {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+    const t1 = Date.now();
+    if (r.status === 429) {
+      const raw = r.headers.get("retry-after");
+      const ra = Number(raw) || 5;
+      console.error(`[spotlib] now-playing 429, retry-after=${raw}`);
+      if (ra > MAX_RETRY_AFTER_S) {
+        pollBackoffUntil = Date.now() + 600_000;
+        broadcast({ type: "error", error: "rate_limited", retry_after: ra });
+        delay = 600_000;
+      } else {
+        pollBackoffUntil = Date.now() + ra * 1000;
+        delay = ra * 1000 + 250;
+      }
+    } else if (r.status === 204) {
+      applyState(shapeNowPlaying(null, t1));
+    } else if (r.status === 401) {
+      oauthCache = null;
+      delay = 500;
+    } else if (r.ok) {
+      const d = await r.json();
+      const next = shapeNowPlaying(d, Math.round((t0 + t1) / 2));
+      applyState(next);
+      if (next.playing && next.item) {
+        const remaining = next.item.duration_ms - next.progress_ms - (Date.now() - next.timestamp);
+        delay = Math.max(1000, Math.min(POLL_PLAYING_MS, remaining + 300));
+      }
+    } else {
+      console.error("[spotlib] now-playing", r.status);
+    }
+  } catch (err) {
+    if (!err.skip) console.error("[spotlib] now-playing poll:", err.message);
+    else delay = Math.max(500, pollBackoffUntil - Date.now() + 250);
+  }
+  schedulePoll(delay);
+}
+
+function schedulePoll(ms) {
+  if (pollTimer || wss.clients.size === 0) return;
+  pollTimer = setTimeout(pollNowPlaying, ms);
+}
+
+function applyState(next) {
+  const prev = nowPlaying;
+  nowPlaying = next;
+  hasState = true;
+  stateWaiters.splice(0).forEach((f) => f());
+  const key = `${next.item?.id ?? ""}|${next.playing}`;
+  let seeked = false;
+  if (key === lastKey && next.playing && prev.playing) {
+    const expected = prev.progress_ms + (next.timestamp - prev.timestamp);
+    seeked = Math.abs(expected - next.progress_ms) > 2000;
+  }
+  if (key !== lastKey || seeked) {
+    lastKey = key;
+    broadcast({ ...next, reason: seeked ? "seek" : "change" });
+  }
+}
+
+function broadcast(msg) {
+  const s = JSON.stringify(msg);
+  for (const c of wss.clients) if (c.ready && c.readyState === 1) c.send(s);
+}
+
+server.on("upgrade", (req, socket, head) => {
+  try {
+    const ip = clientIp(req);
+    const url = new URL(req.url, "http://localhost");
+    if (url.pathname !== "/ws") throw new HttpError(404, "Not Found");
+    if (!req.headers["x-api-key"] && url.searchParams.has("key")) {
+      req.headers["x-api-key"] = url.searchParams.get("key");
+    }
+    requireKey(req, ip);
+    if ((wsPerIp.get(ip) ?? 0) >= WS_MAX_PER_IP) throw new HttpError(429, "too many connections");
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wsPerIp.set(ip, (wsPerIp.get(ip) ?? 0) + 1);
+      ws.isAlive = true;
+      ws.on("pong", () => { ws.isAlive = true; });
+      ws.on("error", () => {});
+      ws.on("close", () => {
+        const n = (wsPerIp.get(ip) ?? 1) - 1;
+        if (n <= 0) wsPerIp.delete(ip); else wsPerIp.set(ip, n);
+      });
+      ws.on("message", (m) => {
+        if (ws.ready && String(m) === "refresh") ws.send(JSON.stringify({ ...nowPlaying, reason: "refresh" }));
+      });
+      if (wss.clients.size === 1) {
+        hasState = false;
+        lastKey = "";
+        clearTimeout(pollTimer);
+        pollTimer = null;
+        pollNowPlaying();
+      } else {
+        schedulePoll(0);
+      }
+      waitFirstState().then(() => {
+        if (ws.readyState !== 1) return;
+        ws.ready = true;
+        ws.send(JSON.stringify({ ...nowPlaying, reason: "connect", server_time: Date.now() }));
+      });
+    });
+  } catch (err) {
+    const status = err instanceof HttpError ? err.status : 500;
+    const text = status === 401 ? "Unauthorized" : status === 429 ? "Too Many Requests" : status === 404 ? "Not Found" : "Error";
+    socket.write(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+  }
+});
+
+setInterval(() => {
+  for (const c of wss.clients) {
+    if (!c.isAlive) { c.terminate(); continue; }
+    c.isAlive = false;
+    c.ping();
+  }
+}, 30_000).unref();
 
 server.headersTimeout = 15_000;
 server.requestTimeout = 300_000;
