@@ -705,7 +705,7 @@ server.on("upgrade", (req, socket, head) => {
   try {
     const ip = clientIp(req);
     const url = new URL(req.url, "http://localhost");
-    if (url.pathname !== "/ws") throw new HttpError(404, "Not Found");
+    if (url.pathname !== "/presence") throw new HttpError(404, "Not Found");
     if (!req.headers["x-api-key"] && url.searchParams.has("key")) {
       req.headers["x-api-key"] = url.searchParams.get("key");
     }
